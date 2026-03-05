@@ -18,6 +18,9 @@ library(knitr)
 library(patchwork)
 library(readxl)
 library(stargazer)
+library(car)
+library(modelsummary)
+library(data.table)
 
 
 
@@ -536,7 +539,6 @@ for (i in seq_len(nrow(coef_tbl))) {
 
 df_4$residuals <- resid(model_4)
 
-
 plot_resid_data <- df_4 %>%
   select(residuals, age, hours, female) %>%
   pivot_longer(
@@ -597,11 +599,320 @@ print(kable(vcov_classical,
 
 # e - t test for beta_1 = beta_2#
 
+t_stat_test_2 <- (coefs["age"] + coefs["hours"]) /
+  sqrt(vcov_classical["age","age"] + vcov_classical["hours","hours"] + 2*vcov_classical["age","hours"])
+
+print(t_stat_test_2) # Because t stat is above 
+
+### f ###
+
+df_4 <- df_4 %>%
+  mutate(part_time = if_else(hours < 40, 1, 0), 
+         greedy = if_else(hours > 40, 1, 0), 
+         int_female_part_time = female * part_time, 
+         int_female_greedy = female*greedy)
+
+# Estimate the new model # 
+
+model_4_b <- lm(ln_wage ~ age + part_time + greedy + female + int_female_part_time + int_female_greedy, data = df_4)
+# Print result# 
+
+stargazer(model_4_b, type = "latex")
+
+# Extract standard errors #
+test_f <- linearHypothesis(model_4_b,
+                 c("int_female_part_time = 0",
+                   "int_female_greedy = 0"))
+
+F_stat <- test_f$F[2]
+p_val  <- test_f$`Pr(>F)`[2]
+df1    <- test_f$Df[2]
+df2    <- test_f$Res.Df[2]
+
+latex_f <- sprintf("\\[ F(%d,%d) = %.2f, \\; p = %.3f \\]", df1, df2, F_stat, p_val)
+
+cat(latex_f)
 
 
+########## Question 6 ############
+
+#Simulate data # 
+
+set.seed(12345)   
+
+# Parameters from the problem
+n_industry   <- 4       # number of industries (g)
+firms_per_ind <- 25     # firms per industry (f)
+emp_per_firm  <- 100    # employees per firm (e)
+N_firms       <- n_industry * firms_per_ind
+N_employees   <- N_firms * emp_per_firm
+
+# DGP parameters (change these if you want other cases)
+beta  <- 0      # β (for Y = beta * X + phi_f + eps)
+lambda <- 0     # λ (weight on U_f when building X)
+omega  <- 0     # ω (weight on W_g when building X)
+# note: the weight on eta is (1 - lambda - omega)
+
+# check weights sensible
+if ( (1 - lambda - omega) < 0 ) stop("lambda + omega must be <= 1")
+
+# sds implied by distributions in the screenshot:
+sd_U  <- sqrt(5)    # U_f ~ N(0,5)  (variance = 5)
+sd_W  <- sqrt(5)    # W_g ~ N(0,5)
+sd_eta <- sqrt(5)   # eta_e ~ N(0,5)
+sd_phi <- sqrt(25)  # phi_f ~ N(0,25)
+sd_eps <- sqrt(25)  # eps_e ~ N(0,25)
+
+# Build mapping: industry -> firms -> employees
+industry_id <- rep(1:n_industry, each = firms_per_ind * emp_per_firm)
+# create firm ids from 1..N_firms
+firm_seq <- rep(1:N_firms, each = emp_per_firm)
+# alternatively create firm-to-industry mapping
+firm_to_industry <- rep(1:n_industry, each = firms_per_ind)
+
+# Generate firm-level and industry-level random variables
+# U_f for each firm:
+U_f <- rnorm(N_firms, mean = 0, sd = sqrt(5))
+
+# W_g for each industry:
+W_g <- rnorm(n_industry, mean = 0, sd = sqrt(5) )
+
+# phi_f (firm fixed effect) for each firm:
+phi_f <- rnorm(N_firms, mean = 0, sd = sqrt(25))
+
+# Employee-level shocks eta_e and eps_e
+eta_e <- rnorm(N_employees, mean = 0, sd = sqrt(5))
+eps_e <- rnorm(N_employees, mean = 0, sd = sqrt(25))
+
+# Now assemble the full dataset
+df <- data.frame(
+  emp_id = 1:N_employees,
+  firm_id = firm_seq,
+  industry_id = industry_id
+)
+
+# attach firm-level and industry-level variables to employees
+df$U_f <- U_f[df$firm_id]                    # firm-level U
+df$W_g <- W_g[df$industry_id]                # industry-level W
+df$phi_f <- phi_f[df$firm_id]                # firm FE
+df$eta_e <- eta_e
+df$eps_e <- eps_e
+
+# Construct X_e according to X_e = lambda * U_f + omega * W_g + (1-lambda-omega)*eta_e
+df$X <- lambda * df$U_f + omega * df$W_g + (1 - lambda - omega) * df$eta_e
+
+# Construct outcome Y_e = beta * X + phi_f + eps
+df$Y <- beta * df$X + df$phi_f + df$eps_e
+
+# quick sanity checks
+cat("Total employees:", nrow(df), "\n")
+cat("Total firms:", length(unique(df$firm_id)), "\n")
+cat("Firms per industry (table):\n"); print(table(firm_to_industry))
+cat("\nSummary of key vars:\n")
+print(summary(df[, c("X","Y","phi_f","U_f","W_g","eta_e","eps_e")]))
+
+# e.g., verify that each firm has emp_per_firm employees
+print(table(df$firm_id)[1:6])   # show counts for first 6 firms
+
+## Run OLS regression ## 
+
+model_6 <- feols(Y ~ X, data = df, cluster = "firm_id")
+
+# Print to overleaf # 
+etable(model_6, file = "cluster_table.tex", title = "OLS result - Clustered errors")
+
+##### b #####
+
+#MC simulations and estimations of data # 
 
 
+run_mc_compare_se <- function(lambda = 0, omega = 0, beta = 0,
+                              n_industry = 4, firms_per_ind = 25, emp_per_firm = 100,
+                              reps = 1000, seed = 123, show_progress = TRUE) {
+  set.seed(seed)
+  if (lambda + omega > 1) stop("lambda + omega must be <= 1")
+  
+  N_firms <- n_industry * firms_per_ind
+  N_employees <- N_firms * emp_per_firm
+  
+  results <- tibble::tibble(
+    rep = seq_len(reps),
+    est = as.numeric(NA),          # coefficient estimate (same for both)
+    se_classic = as.numeric(NA),   # classical (lm) se
+    p_classic  = as.numeric(NA),   # p-value using classical se
+    se_cluster = as.numeric(NA),   # cluster-robust se (firm level)
+    p_cluster  = as.numeric(NA)    # p-value using clustered se
+  )
+  
+  if (show_progress) pb <- txtProgressBar(min = 0, max = reps, style = 3)
+  
+  for (r in seq_len(reps)) {
+    # ---------- DGP ----------
+    U_f   <- rnorm(N_firms, 0, sqrt(5))
+    W_g   <- rnorm(n_industry, 0, sqrt(5))
+    phi_f <- rnorm(N_firms, 0, sqrt(25))
+    
+    eta_e <- rnorm(N_employees, 0, sqrt(5))
+    eps_e <- rnorm(N_employees, 0, sqrt(25))
+    
+    firm_id     <- rep(1:N_firms, each = emp_per_firm)
+    industry_id <- rep(rep(1:n_industry, each = firms_per_ind), each = emp_per_firm)
+    
+    df <- tibble::tibble(
+      emp_id = seq_len(N_employees),
+      firm_id = firm_id,
+      industry_id = industry_id
+    ) %>%
+      dplyr::mutate(
+        U_f = U_f[firm_id],
+        W_g = W_g[industry_id],
+        phi_f = phi_f[firm_id],
+        eta_e = eta_e,
+        eps_e = eps_e,
+        X = lambda * U_f + omega * W_g + (1 - lambda - omega) * eta_e,
+        Y = beta * X + phi_f + eps_e
+      )
+    
+    # ---------- Estimation ----------
+    # classical OLS (lm) for i.i.d. SE
+    fit_lm <- tryCatch(lm(Y ~ X, data = df), error = function(e) e)
+    if (inherits(fit_lm, "error")) {
+      # leave NA and continue; print a message for the first/last iteration
+      if (r == 1 || r == reps) message("lm error at rep ", r, ": ", fit_lm$message)
+      if (show_progress) setTxtProgressBar(pb, r)
+      next
+    }
+    
+    # clustered estimator using fixest (cluster at firm level)
+    fit_fe <- tryCatch(feols(Y ~ X, data = df, cluster = "firm_id"),
+                       error = function(e) e)
+    if (inherits(fit_fe, "error")) {
+      if (r == 1 || r == reps) message("feols error at rep ", r, ": ", fit_fe$message)
+      if (show_progress) setTxtProgressBar(pb, r)
+      next
+    }
+    
+    # extract coefficient (should be identical for lm and feols without FE)
+    coef_lm <- coef(fit_lm)
+    if (!"X" %in% names(coef_lm)) {
+      if (r == 1 || r == reps) message("No coef X in lm at rep ", r, ". Names: ", paste(names(coef_lm), collapse = ", "))
+      if (show_progress) setTxtProgressBar(pb, r)
+      next
+    }
+    est <- as.numeric(coef_lm["X"])
+    
+    # classical se from lm summary
+    lm_sum <- summary(fit_lm)
+    se_classic <- as.numeric(lm_sum$coefficients["X", "Std. Error"])
+    t_classic  <- est / se_classic
+    p_classic  <- 2 * pnorm(-abs(t_classic))   # normal approx
+    
+    # clustered se from fixest vcov
+    vc_cluster <- tryCatch(vcov(fit_fe), error = function(e) e)
+    if (inherits(vc_cluster, "error")) {
+      if (r == 1 || r == reps) message("vcov error at rep ", r, ": ", vc_cluster$message)
+      if (show_progress) setTxtProgressBar(pb, r)
+      next
+    }
+    if (!("X" %in% rownames(vc_cluster))) {
+      if (r == 1 || r == reps) message("vcov missing 'X' row at rep ", r, ". Row names: ", paste(rownames(vc_cluster), collapse = ", "))
+      if (show_progress) setTxtProgressBar(pb, r)
+      next
+    }
+    se_cluster <- sqrt(as.numeric(vc_cluster["X","X"]))
+    t_cluster  <- est / se_cluster
+    p_cluster  <- 2 * pnorm(-abs(t_cluster))
+    
+    # store
+    results[r, "est"] <- est
+    results[r, "se_classic"] <- se_classic
+    results[r, "p_classic"]  <- p_classic
+    results[r, "se_cluster"] <- se_cluster
+    results[r, "p_cluster"]  <- p_cluster
+    
+    if (show_progress) setTxtProgressBar(pb, r)
+  } # end reps
+  
+  if (show_progress) close(pb)
+  
+  # ---------- Summaries ----------
+  # valid counts
+  n_valid_classic <- sum(is.finite(results$se_classic))
+  n_valid_cluster <- sum(is.finite(results$se_cluster))
+  n_valid_est     <- sum(is.finite(results$est))
+  
+  # compute rejection rates at alpha = 0.05 (two-sided)
+  rej_classic <- mean(results$p_classic < 0.05, na.rm = TRUE)
+  rej_cluster <- mean(results$p_cluster < 0.05, na.rm = TRUE)
+  
+  # other MC stats for est
+  mean_est <- mean(results$est, na.rm = TRUE)
+  bias     <- mean_est - beta
+  emp_sd   <- sd(results$est, na.rm = TRUE)
+  mean_se_classic <- mean(results$se_classic, na.rm = TRUE)
+  mean_se_cluster <- mean(results$se_cluster, na.rm = TRUE)
+  
+  summary_tbl <- tibble::tibble(
+    lambda = lambda,
+    omega  = omega,
+    beta   = beta,
+    n_industry = n_industry,
+    firms_per_ind = firms_per_ind,
+    emp_per_firm = emp_per_firm,
+    reps = reps,
+    n_valid_est = n_valid_est,
+    n_valid_classic = n_valid_classic,
+    n_valid_cluster = n_valid_cluster,
+    mean_est = mean_est,
+    bias = bias,
+    emp_sd = emp_sd,
+    mean_se_classic = mean_se_classic,
+    mean_se_cluster = mean_se_cluster,
+    rej_classic = rej_classic,
+    rej_cluster = rej_cluster
+  )
+  
+  list(results = results, summary = summary_tbl)
+}
 
 
+result_6_b <- run_mc_compare_se(lambda = 0, omega = 0, beta = 0,
+                                n_industry = 4, firms_per_ind = 25, emp_per_firm = 100,
+                                reps = 1000, seed = 2026, show_progress = TRUE)
 
+# View summary:
+print(result_6_b$summary)
+
+# Print in overleaf # 
+summary_6_b <- result_6_b$summary
+summary_6_b <- summary_6_b %>% 
+  select(lambda, omega, mean_est, mean_se_classic, mean_se_cluster, rej_classic, rej_cluster)
+
+print(kable(summary_6_b,
+            format = "latex",
+            booktabs = TRUE,
+            digits = 3,
+            caption = "Monte Carlo simulation - Result"))
+
+
+#### c #### 
+
+#Change lambda and omega # 
+
+
+result_6_c <- run_mc_compare_se(lambda = 0.2, omega = 0.7, beta = 0,
+                                n_industry = 4, firms_per_ind = 25, emp_per_firm = 100,
+                                reps = 1000, seed = 2026, show_progress = TRUE)
+
+#Summarise and present the results# 
+
+summary_6_c <- result_6_c$summary
+summary_6_c <- summary_6_c %>% 
+  select(lambda, omega, mean_est, mean_se_classic, mean_se_cluster, rej_classic, rej_cluster)
+
+print(kable(summary_6_c,
+            format = "latex",
+            booktabs = TRUE,
+            digits = 3,
+            caption = "Monte Carlo simulation - Result 2"))
       
