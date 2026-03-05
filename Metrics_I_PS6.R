@@ -16,6 +16,9 @@ library(sandwich)
 library(purrr)
 library(knitr)
 library(patchwork)
+library(readxl)
+library(stargazer)
+
 
 
 ####### Question 1 ########¨
@@ -51,9 +54,7 @@ data_2000 <- gen_data_1(n_sim = n_sim, n = n_obs_2)
 
 #Create functin for estimating model# 
 
-run_estim <- function(n, data, seed = 123) {
-  
-  set.seed(seed)
+run_estim <- function(n, data) {
   
   
   # Estimate models# 
@@ -401,8 +402,206 @@ ggsave(
   height   = 6
 )
 
+##### Question 4 ######### 
+
+# Import data # 
+cps09mar <- read_excel("cps09mar.xlsx")
+
+summary(cps09mar)
+
+# Cleaning data # 
+
+df_4 <- cps09mar %>%
+  mutate(wage = earnings/(hours*week), 
+         ln_wage = log(wage)) %>%
+  filter(wage > 1)
+
+summary(df_4)
+
+
+# Plot the data # 
+
+plot_y <- ggplot(df_4, aes(x = ln_wage)) +
+  geom_density(fill = "steelblue", alpha = 0.5) +
+  labs(
+    x = "Log Wage",
+    y = "Density"
+  ) +
+  theme_minimal()
+
+plot(plot_y)
+
+ggsave(
+  filename = "dist_ln_wage.pdf",
+  plot     = plot_y,
+  width    = 8,
+  height   = 6
+)
+
+# Estimation #   
+
+model_4 <- lm(ln_wage ~ age + hours + female, data = df_4)
+summary(model_4)
+
+#Print results# 
+stargazer(model_4, type = "latex")
+
+## Plot confidence intervals with different SE:s ##
+
+# Extract standard errors # 
+coefs <- coef(model_4)
+vcov_classical <- vcov(model_4)
+vcov_hc1       <- vcovHC(model_4, type = "HC1")
+
+# build a table with estimate + both SEs and CIs
+coef_tbl <- tibble(
+  term = names(coefs),
+  estimate = as.numeric(coefs),
+  se_classical = sqrt(diag(vcov_classical)),
+  se_HC1       = sqrt(diag(vcov_hc1))
+) %>%
+  mutate(
+    ci_lo_classical = estimate - 1.96 * se_classical,
+    ci_hi_classical = estimate + 1.96 * se_classical,
+    ci_lo_HC1 = estimate - 1.96 * se_HC1,
+    ci_hi_HC1 = estimate + 1.96 * se_HC1
+  ) %>%
+  # optional: remove intercept for plotting
+  filter(term != "(Intercept)")
+
+# Print coef table # 
+
+print(kable(coef_tbl,
+            format = "latex",
+            booktabs = TRUE,
+            digits = 3,
+            caption = paste0("Coefficients")))
+
+# Plot one graph# 
+plot_data <- coef_tbl %>%
+  pivot_longer(cols = c(ci_lo_classical, ci_hi_classical, ci_lo_HC1, ci_hi_HC1), 
+                   names_to = c(".value", "method"), names_pattern = "(lo|hi)_(.*)")
+
+# 4) Plot: point + error bars, dodged so the two methods sit side-by-side
+plot_4 <-ggplot(plot_data, aes(x = method, y = estimate)) + geom_point(size = 3) + 
+  geom_errorbar(aes(ymin = lo, ymax = hi), width = 0.2) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  facet_wrap(~ term, scales = "free_y") +
+  labs(
+         x = "",
+         y = "Coefficient estimate"
+       ) +   theme_minimal()
+
+
+# show plot
+print(plot_4)
+
+ggsave(
+  filename = "ci_combined.pdf",
+  plot     = plot_4,
+  width    = 8,
+  height   = 6
+)
+
+#Plot 3 separate graphs# 
+
+dir.create("coef_plots", showWarnings = FALSE)  # folder for plots
+
+for (i in seq_len(nrow(coef_tbl))) {
+  row <- coef_tbl[i, ]
+  term_i <- row$term
+  
+  plot_df <- tibble(
+    method = c("Classical", "HC1"),
+    estimate = c(row$estimate, row$estimate),
+    lo = c(row$ci_lo_classical, row$ci_lo_HC1),
+    hi = c(row$ci_hi_classical, row$ci_hi_HC1)
+  )
+  
+  p <- ggplot(plot_df, aes(x = method, y = estimate, color = method)) +
+    geom_point(size = 3) +
+    geom_errorbar(aes(ymin = lo, ymax = hi), width = 0.15, size = 1) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "gray40") +
+    labs(x = "", y = "Estimate (ln wage)") +
+    theme_minimal() +
+    theme(legend.position = "none")
+  
+    print(p)
+  
+  fname <- file.path("coef_plots", paste0("coef_plot_", term_i, ".pdf"))
+  ggsave(filename = fname, plot = p, width = 5, height = 4)
+}
+
+# Plot the residuals over age, female and hours #
+
+df_4$residuals <- resid(model_4)
+
+
+plot_resid_data <- df_4 %>%
+  select(residuals, age, hours, female) %>%
+  pivot_longer(
+    cols = c(age, hours, female),
+    names_to = "variable",
+    values_to = "value"
+  )
+
+plot_resid<- ggplot(plot_resid_data, aes(x = value, y = residuals)) +
+  geom_point(alpha = 0.4) +
+  geom_smooth(method = "loess", se = FALSE, color = "red") +
+  facet_wrap(~ variable, scales = "free_x") +
+  labs(
+    x = "",
+    y = "Residuals"
+  ) +
+  theme_minimal()
+
+print(plot_resid)
+
+ggsave(
+  filename = "residuals.pdf",
+  plot     = plot_resid,
+  width    = 8,
+  height   = 6
+)
+
+# c - T-test for female # 
+t_test_beta_3 <- coef_tbl %>%
+  filter(term == "female") %>%
+  mutate(
+    t_beta_3_classical = (estimate - (-0.25)) / se_classical,
+    t_beta_3_HC1 = (estimate - (-0.25)) / se_HC1,
+    p_value_classical = 2 * pt(abs(t_beta_3_classical),
+                               df = df.residual(model_4),
+                               lower.tail = FALSE),
+    p_value_HC1 = 2 * pt(abs(t_beta_3_HC1),
+                         df = df.residual(model_4),
+                         lower.tail = FALSE)
+  )%>%
+  select(term, t_beta_3_classical, t_beta_3_HC1, p_value_classical, p_value_HC1)
+
+print(kable(t_test_beta_3,
+            format = "latex",
+            booktabs = TRUE,
+            digits = 3,
+            caption = "t-test result"))
+
+# d - Print the variance -covariance matrix #
+
+print(vcov_classical)
+
+print(kable(vcov_classical,
+            format = "latex",
+            booktabs = TRUE,
+            digits = 10,
+            caption = "Variance -covariance matrix"))
+
+# e - t test for beta_1 = beta_2#
 
 
 
 
 
+
+
+
+      
